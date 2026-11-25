@@ -1,0 +1,580 @@
+#!/usr/bin/env python3
+"""Isolated, lived-in Chrome profile manager and focus-safe CDP launcher for AI agents.
+
+Organizes dedicated Chrome profiles in ~/.agent-chrome/ so coding and browsing
+agents can share warm, logged-in sessions without colliding, touching everyday
+Chrome, triggering remote-debugging approval prompts, or stealing window focus.
+
+Each profile runs one Chrome process + one focus-safe local CDP proxy. Multiple
+agents can attach to the same proxy port simultaneously (each opening and
+closing its own background tab).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from typing import Any
+
+HOME_DIR = Path(os.environ.get("AGENT_CHROME_HOME", str(Path.home() / ".agent-chrome"))).expanduser()
+REGISTRY_PATH = HOME_DIR / "registry.json"
+PROFILES_DIR = HOME_DIR / "profiles"
+LOGS_DIR = HOME_DIR / "logs"
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def find_chrome_bin() -> str:
+    env_bin = os.environ.get("AGENT_CHROME_BIN", "").strip()
+    if env_bin:
+        return env_bin
+    candidates = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    raise FileNotFoundError(
+        "Could not locate Chrome/Chromium. Set AGENT_CHROME_BIN to the browser executable path."
+    )
+
+
+def default_registry() -> dict[str, Any]:
+    return {
+        "profiles": {
+            "default": {
+                "description": "Isolated lived-in Chrome profile for agent reads (clicks/scroll allowed, typing blocked)",
+                "profile_dir": "~/.agent-chrome/profiles/default",
+                "chrome_port": 9224,
+                "proxy_port": 9225,
+                "mode": "no-typing",
+                "default_launch": "headless",
+                "login_url": "about:blank",
+                "sites": [],
+                "notes": "Sign in once via `agent-chrome login default <url>`, then quit Chrome and run `agent-chrome start default`.",
+            }
+        }
+    }
+
+
+def load_registry() -> dict[str, Any]:
+    if not REGISTRY_PATH.exists():
+        HOME_DIR.mkdir(parents=True, exist_ok=True)
+        PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        reg = default_registry()
+        save_registry(reg)
+        return reg
+    with REGISTRY_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_registry(reg: dict[str, Any]) -> None:
+    HOME_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = REGISTRY_PATH.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(reg, f, indent=2)
+        f.write("\n")
+    tmp.replace(REGISTRY_PATH)
+
+
+def is_port_open(port: int, host: str = "127.0.0.1") -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.25)
+        return s.connect_ex((host, port)) == 0
+
+
+def pids_listening(port: int) -> list[int]:
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-t", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+    pids: list[int] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.isdigit():
+            pids.append(int(line))
+    return pids
+
+
+def stop_port(port: int) -> bool:
+    pids = pids_listening(port)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    return bool(pids)
+
+
+def find_helper_script(filename: str) -> Path:
+    candidates = [
+        SCRIPT_DIR / filename,
+        HOME_DIR / "bin" / filename,
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    raise FileNotFoundError(f"Could not find {filename} in {candidates}")
+
+
+def get_profile(reg: dict[str, Any], name: str) -> dict[str, Any]:
+    profiles = reg.get("profiles", {})
+    if name not in profiles:
+        available = ", ".join(sorted(profiles.keys())) or "(none)"
+        print(f"Unknown profile {name!r}. Available: {available}", file=sys.stderr)
+        raise SystemExit(1)
+    return profiles[name]
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    reg = load_registry()
+    profiles = reg.get("profiles", {})
+    if args.json:
+        enriched = {}
+        for name, cfg in profiles.items():
+            c_up = is_port_open(int(cfg["chrome_port"]))
+            p_up = is_port_open(int(cfg["proxy_port"]))
+            enriched[name] = {
+                **cfg,
+                "chrome_running": c_up,
+                "proxy_running": p_up,
+                "proxy_url": f"http://127.0.0.1:{cfg['proxy_port']}",
+            }
+        print(json.dumps(enriched, indent=2))
+        return 0
+
+    if not profiles:
+        print("No profiles registered.")
+        return 0
+
+    for name, cfg in profiles.items():
+        c_port = int(cfg["chrome_port"])
+        p_port = int(cfg["proxy_port"])
+        c_up = is_port_open(c_port)
+        p_up = is_port_open(p_port)
+        if c_up and p_up:
+            state = "RUNNING"
+        elif c_up or p_up:
+            state = "PARTIAL"
+        else:
+            state = "stopped"
+        sites = ", ".join(cfg.get("sites", [])) or "(none listed)"
+        print(f"{name} [{state}]  mode={cfg.get('mode', 'no-typing')}  proxy=http://127.0.0.1:{p_port} (chrome:{c_port})")
+        print(f"  sites:   {sites}")
+        print(f"  dir:     {cfg['profile_dir']}")
+        if cfg.get("description"):
+            print(f"  desc:    {cfg['description']}")
+    print(f"\nRegistry: {REGISTRY_PATH}")
+    return 0
+
+
+def cmd_login(args: argparse.Namespace) -> int:
+    reg = load_registry()
+    cfg = get_profile(reg, args.profile)
+    chrome_bin = find_chrome_bin()
+    profile_dir = Path(cfg["profile_dir"]).expanduser()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(profile_dir, 0o700)
+
+    c_port = int(cfg["chrome_port"])
+    if is_port_open(c_port):
+        print(f"Stopping running Chrome for {args.profile} on 127.0.0.1:{c_port} so profile can open visibly...")
+        stop_port(c_port)
+        for _ in range(25):
+            if not is_port_open(c_port):
+                break
+            time.sleep(0.2)
+
+    url = args.url or cfg.get("login_url") or "about:blank"
+    print(f"Opening visible Chrome for profile '{args.profile}' ({profile_dir})")
+    print(f"Sign in to your sites, then quit that Chrome window and run: agent-chrome start {args.profile}")
+    cmd = [
+        chrome_bin,
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        url,
+    ]
+    os.execv(chrome_bin, cmd)
+    return 0
+
+
+def ensure_profile_running(
+    name: str,
+    cfg: dict[str, Any],
+    *,
+    visible: bool = False,
+    foreground: bool = False,
+    quiet_stream: Any = None,
+) -> int:
+    out = quiet_stream if quiet_stream is not None else sys.stdout
+    profile_dir = Path(cfg["profile_dir"]).expanduser()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(profile_dir, 0o700)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+    c_port = int(cfg["chrome_port"])
+    p_port = int(cfg["proxy_port"])
+    mode = cfg.get("mode", "no-typing")
+    launch_visible = visible or cfg.get("default_launch") == "visible"
+
+    if not is_port_open(c_port):
+        chrome_bin = find_chrome_bin()
+        chrome_cmd = [
+            chrome_bin,
+            "--window-size=1440,900",
+            f"--user-data-dir={profile_dir}",
+            "--remote-debugging-address=127.0.0.1",
+            f"--remote-debugging-port={c_port}",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ]
+        if not launch_visible:
+            chrome_cmd.insert(1, "--headless=new")
+
+        chrome_log = (LOGS_DIR / f"{name}-chrome.log").open("ab")
+        subprocess.Popen(
+            chrome_cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=chrome_log,
+            stderr=chrome_log,
+            start_new_session=True,
+        )
+        for _ in range(50):
+            if is_port_open(c_port):
+                break
+            time.sleep(0.2)
+        if not is_port_open(c_port):
+            print(f"Timed out waiting for Chrome on 127.0.0.1:{c_port}", file=sys.stderr)
+            return 1
+        kind = "visible" if launch_visible else "headless"
+        print(f"Started {kind} Chrome for '{name}' on 127.0.0.1:{c_port}", file=out)
+    else:
+        if quiet_stream is None:
+            print(f"Chrome for '{name}' already running on 127.0.0.1:{c_port}", file=out)
+
+    if not is_port_open(p_port):
+        proxy_script = find_helper_script("chrome_proxy.py")
+        proxy_cmd = [
+            "uv",
+            "run",
+            "--script",
+            str(proxy_script),
+            "--port",
+            str(p_port),
+            "--upstream-port",
+            str(c_port),
+        ]
+        if mode == "read-write":
+            proxy_cmd.append("--allow-typing")
+
+        if foreground:
+            print(f"Running proxy for '{name}' in foreground on 127.0.0.1:{p_port} ({mode})", file=out)
+            os.execvp("uv", proxy_cmd)
+
+        proxy_log = (LOGS_DIR / f"{name}-proxy.log").open("ab")
+        subprocess.Popen(
+            proxy_cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=proxy_log,
+            stderr=proxy_log,
+            start_new_session=True,
+        )
+        for _ in range(50):
+            if is_port_open(p_port):
+                break
+            time.sleep(0.2)
+        if not is_port_open(p_port):
+            print(
+                f"Timed out waiting for proxy on 127.0.0.1:{p_port}. Check {LOGS_DIR / (name + '-proxy.log')}",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"Started proxy for '{name}' on http://127.0.0.1:{p_port} (mode={mode})", file=out)
+    else:
+        if quiet_stream is None:
+            print(f"Proxy for '{name}' already running on http://127.0.0.1:{p_port}", file=out)
+
+    return 0
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    reg = load_registry()
+    cfg = get_profile(reg, args.profile)
+    return ensure_profile_running(
+        args.profile,
+        cfg,
+        visible=args.visible,
+        foreground=args.foreground,
+    )
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    reg = load_registry()
+    cfg = get_profile(reg, args.profile)
+    c_port = int(cfg["chrome_port"])
+    p_port = int(cfg["proxy_port"])
+    profile_dir = str(Path(cfg["profile_dir"]).expanduser())
+
+    p_stopped = stop_port(p_port)
+    c_stopped = stop_port(c_port)
+    subprocess.run(["pkill", "-f", f"user-data-dir={profile_dir}"], stderr=subprocess.DEVNULL, check=False)
+
+    if p_stopped or c_stopped:
+        print(f"Stopped '{args.profile}' (proxy:{p_port}, chrome:{c_port}).")
+    else:
+        print(f"'{args.profile}' was not running.")
+    return 0
+
+
+def next_port_pair(reg: dict[str, Any]) -> tuple[int, int]:
+    used: set[int] = set()
+    for cfg in reg.get("profiles", {}).values():
+        used.add(int(cfg["chrome_port"]))
+        used.add(int(cfg["proxy_port"]))
+    port = 9224
+    while port in used or (port + 1) in used:
+        port += 2
+    return port, port + 1
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    reg = load_registry()
+    profiles = reg.setdefault("profiles", {})
+    if args.name in profiles:
+        print(f"Profile {args.name!r} already exists.", file=sys.stderr)
+        return 1
+    c_port, p_port = next_port_pair(reg)
+    if args.profile_dir:
+        raw_dir = args.profile_dir
+        profile_dir = Path(raw_dir).expanduser()
+    else:
+        raw_dir = f"~/.agent-chrome/profiles/{args.name}"
+        profile_dir = PROFILES_DIR / args.name
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(profile_dir, 0o700)
+    sites = [s.strip() for s in (args.sites or "").split(",") if s.strip()]
+    profiles[args.name] = {
+        "description": args.description or f"Dedicated agent Chrome profile ({args.mode})",
+        "profile_dir": raw_dir,
+        "chrome_port": c_port,
+        "proxy_port": p_port,
+        "mode": args.mode,
+        "default_launch": "visible" if args.visible else "headless",
+        "login_url": args.login_url or (f"https://{sites[0]}" if sites else "about:blank"),
+        "sites": sites,
+        "notes": "",
+    }
+    save_registry(reg)
+    print(f"Added profile '{args.name}' (proxy=http://127.0.0.1:{p_port}, chrome={c_port}, mode={args.mode})")
+    print(f"Next: agent-chrome login {args.name}")
+    return 0
+
+
+def cmd_url(args: argparse.Namespace) -> int:
+    reg = load_registry()
+    cfg = get_profile(reg, args.profile)
+    if args.ensure:
+        rc = ensure_profile_running(args.profile, cfg, quiet_stream=sys.stderr)
+        if rc != 0:
+            return rc
+    print(f"http://127.0.0.1:{int(cfg['proxy_port'])}")
+    return 0
+
+
+def cmd_browse(args: argparse.Namespace) -> int:
+    reg = load_registry()
+    cfg = get_profile(reg, args.profile)
+    if not getattr(args, "no_start", False):
+        rc = ensure_profile_running(args.profile, cfg, quiet_stream=sys.stderr)
+        if rc != 0:
+            return rc
+    proxy_url = f"http://127.0.0.1:{int(cfg['proxy_port'])}"
+    browse_script = find_helper_script("cdp_browse.py")
+    cmd = ["uv", "run", "--script", str(browse_script), "--proxy", proxy_url, args.cmd]
+    if args.cmd == "tabs":
+        if args.json:
+            cmd.append("--json")
+    elif args.cmd == "close-tab":
+        cmd.append(args.target_id)
+    elif args.cmd == "read":
+        cmd.extend([
+            args.url,
+            "--wait", str(args.wait),
+            "--scrolls", str(args.scrolls),
+            "--max-chars", str(args.max_chars),
+        ])
+        if args.selector:
+            cmd.extend(["--selector", args.selector])
+        if args.json:
+            cmd.append("--json")
+    elif args.cmd == "links":
+        cmd.extend([args.url, "--wait", str(args.wait), "--limit", str(args.limit)])
+        if args.selector:
+            cmd.extend(["--selector", args.selector])
+        if args.filter:
+            cmd.extend(["--filter", args.filter])
+        if args.json:
+            cmd.append("--json")
+    elif args.cmd == "eval":
+        cmd.extend([args.url, args.js, "--wait", str(args.wait)])
+        if args.json:
+            cmd.append("--json")
+    elif args.cmd == "screenshot":
+        cmd.extend([args.url, "--out", args.out, "--wait", str(args.wait)])
+        if args.full_page:
+            cmd.append("--full-page")
+        if args.width:
+            cmd.extend(["--width", str(args.width)])
+        if args.height:
+            cmd.extend(["--height", str(args.height)])
+    return subprocess.call(cmd)
+
+
+def cmd_sites(args: argparse.Namespace) -> int:
+    reg = load_registry()
+    cfg = get_profile(reg, args.profile)
+    sites: list[str] = list(cfg.get("sites", []))
+    for s in args.add or []:
+        s = s.strip()
+        if s and s not in sites:
+            sites.append(s)
+    for s in args.remove or []:
+        s = s.strip()
+        if s in sites:
+            sites.remove(s)
+    cfg["sites"] = sites
+    save_registry(reg)
+    print(f"{args.profile} sites: {', '.join(sites) or '(none)'}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Manage isolated, focus-safe Chrome profiles for AI agents.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_list = sub.add_parser("list", aliases=["status"], help="List registered profiles and live status.")
+    p_list.add_argument("--json", action="store_true", help="Output JSON.")
+
+    p_login = sub.add_parser("login", help="Open visible Chrome to sign in to a profile.")
+    p_login.add_argument("profile", help="Profile name.")
+    p_login.add_argument("url", nargs="?", help="Optional URL to open for sign-in.")
+
+    p_start = sub.add_parser("start", help="Start Chrome and focus-safe proxy for a profile.")
+    p_start.add_argument("profile", help="Profile name.")
+    p_start.add_argument("--visible", action="store_true", help="Launch visible Chrome instead of headless.")
+    p_start.add_argument("--foreground", action="store_true", help="Keep proxy attached to current terminal.")
+
+    p_stop = sub.add_parser("stop", help="Stop Chrome and proxy for a profile.")
+    p_stop.add_argument("profile", help="Profile name.")
+
+    p_add = sub.add_parser("add", help="Register a new Chrome profile.")
+    p_add.add_argument("name", help="Short profile name (e.g. research).")
+    p_add.add_argument("--sites", default="", help="Comma-separated list of sites you plan to sign in to.")
+    p_add.add_argument("--mode", choices=["no-typing", "read-write"], default="no-typing")
+    p_add.add_argument("--description", default="", help="Short description of this profile.")
+    p_add.add_argument("--login-url", default="", help="Default URL for `agent-chrome login`.")
+    p_add.add_argument("--profile-dir", default="", help="Optional existing profile directory path.")
+    p_add.add_argument("--visible", action="store_true", help="Default to visible Chrome instead of headless.")
+
+    p_sites = sub.add_parser("sites", help="Update the documented list of logged-in sites for a profile.")
+    p_sites.add_argument("profile", help="Profile name.")
+    p_sites.add_argument("--add", action="append", help="Add a site/domain to this profile's manifest.")
+    p_sites.add_argument("--remove", action="append", help="Remove a site/domain from this profile's manifest.")
+
+    p_url = sub.add_parser("url", help="Print the focus-safe proxy URL for a profile.")
+    p_url.add_argument("profile", help="Profile name.")
+    p_url.add_argument("--ensure", action="store_true", help="Start the profile if it is stopped.")
+
+    p_tabs = sub.add_parser("tabs", help="List open tabs in a profile.")
+    p_tabs.add_argument("profile", help="Profile name.")
+    p_tabs.add_argument("--no-start", action="store_true", help="Do not auto-start if stopped.")
+    p_tabs.add_argument("--json", action="store_true")
+
+    p_close = sub.add_parser("close-tab", help="Close an open tab by target ID.")
+    p_close.add_argument("profile", help="Profile name.")
+    p_close.add_argument("target_id", help="CDP target ID from `agent-chrome tabs`.")
+    p_close.add_argument("--no-start", action="store_true", help="Do not auto-start if stopped.")
+
+    p_read = sub.add_parser("read", help="Open a URL in a background tab, extract page text, and close the tab.")
+    p_read.add_argument("profile", help="Profile name.")
+    p_read.add_argument("url", help="URL to read.")
+    p_read.add_argument("--wait", type=float, default=2.0, help="Extra settle seconds after load (default: 2.0).")
+    p_read.add_argument("--selector", default="", help="Optional CSS selector to read.")
+    p_read.add_argument("--scrolls", type=int, default=0, help="Number of scrolls before reading.")
+    p_read.add_argument("--max-chars", type=int, default=20000, help="Max text chars (0 = unlimited).")
+    p_read.add_argument("--no-start", action="store_true", help="Do not auto-start if stopped.")
+    p_read.add_argument("--json", action="store_true")
+
+    p_links = sub.add_parser("links", help="Extract links from a URL in a background tab and close the tab.")
+    p_links.add_argument("profile", help="Profile name.")
+    p_links.add_argument("url", help="URL to inspect.")
+    p_links.add_argument("--wait", type=float, default=2.0)
+    p_links.add_argument("--selector", default="")
+    p_links.add_argument("--filter", default="", help="Case-insensitive regex filter on link text or URL.")
+    p_links.add_argument("--limit", type=int, default=100)
+    p_links.add_argument("--no-start", action="store_true")
+    p_links.add_argument("--json", action="store_true")
+
+    p_eval = sub.add_parser("eval", help="Navigate a background tab to a URL, evaluate JS, and close the tab.")
+    p_eval.add_argument("profile", help="Profile name.")
+    p_eval.add_argument("url", help="URL to open.")
+    p_eval.add_argument("js", help="JavaScript expression (Promises awaited).")
+    p_eval.add_argument("--wait", type=float, default=2.0)
+    p_eval.add_argument("--no-start", action="store_true")
+    p_eval.add_argument("--json", action="store_true")
+
+    p_shot = sub.add_parser("screenshot", help="Capture a PNG screenshot of a URL in a background tab.")
+    p_shot.add_argument("profile", help="Profile name.")
+    p_shot.add_argument("url", help="URL to capture.")
+    p_shot.add_argument("--out", required=True, help="Output PNG file path.")
+    p_shot.add_argument("--wait", type=float, default=2.0)
+    p_shot.add_argument("--full-page", action="store_true")
+    p_shot.add_argument("--width", type=int, default=0)
+    p_shot.add_argument("--height", type=int, default=0)
+    p_shot.add_argument("--no-start", action="store_true")
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.cmd in ("list", "status"):
+        return cmd_list(args)
+    if args.cmd == "login":
+        return cmd_login(args)
+    if args.cmd == "start":
+        return cmd_start(args)
+    if args.cmd == "stop":
+        return cmd_stop(args)
+    if args.cmd == "add":
+        return cmd_add(args)
+    if args.cmd == "sites":
+        return cmd_sites(args)
+    if args.cmd == "url":
+        return cmd_url(args)
+    if args.cmd in ("tabs", "close-tab", "read", "links", "eval", "screenshot"):
+        return cmd_browse(args)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
